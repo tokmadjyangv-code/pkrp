@@ -186,6 +186,26 @@ peer_del() {
   echo "REMOVED"
 }
 
+# ---------- тестовый стенд на ЧИСТОМ сервере ----------
+lab() {
+  local ifn=${1:-awg2}
+  echo "== Установка AmneziaWG 3.1 (PPA amnezia) =="
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq
+  apt-get install -y -qq software-properties-common "linux-headers-$(uname -r)" qrencode >/dev/null
+  add-apt-repository -y ppa:amnezia/ppa >/dev/null
+  apt-get install -y -qq amneziawg amneziawg-tools >/dev/null
+  modprobe amneziawg
+  echo "tools: $(awg --version)"; echo "module: $(cat /sys/module/amneziawg/version 2>/dev/null)"
+  echo "== Пересылка пакетов =="
+  echo 'net.ipv4.ip_forward=1' > /etc/sysctl.d/99-awg-forward.conf; sysctl -q -p /etc/sysctl.d/99-awg-forward.conf
+  PROFILE=${PROFILE:-turn} new31 "$ifn" "${2:-phone}"
+  local port; port=$(awk -F' *= *' '$1=="ListenPort"{print $2}' "${AWG_DIR:-/etc/amnezia/amneziawg}/$ifn.conf")
+  if command -v ufw >/dev/null && ufw status | grep -q 'Status: active'; then
+    ufw allow "$port/udp" >/dev/null && ufw route allow in on "$ifn" >/dev/null && echo "ufw: открыт $port/udp, разрешена пересылка с $ifn"
+  fi
+}
+
 # ---------- AWG 3.1 ----------
 check31() {
   set +e +o pipefail
@@ -233,6 +253,18 @@ new31() {
   s1=$(rnd 15 150); s2=$(rnd 15 150); while (( s1 + 56 == s2 || s1 == s2 )); do s2=$(rnd 15 150); done
   s3=$(rnd 12 55); s4=$(rnd 12 27); (( s4 == 16 )) && s4=17
   jmin=30
+  # профиль маскировки: stun (по умолчанию, как было) | turn (по образцу работающего платного VPN)
+  local jc ipk
+  case ${PROFILE:-stun} in
+    turn) jc=9; s1=$(rnd 100 130); s2=$(rnd 100 130); while (( s1 + 56 == s2 || s1 == s2 )); do s2=$(rnd 100 130); done
+          ipk="I1 = <b 0x0003><r 2><b 0x2112A442><r 12><r 20>
+I2 = <b 0x0103><r 2><b 0x2112A442><r 12><r 24>
+I3 = <b 0x0008><r 2><b 0x2112A442><r 12><r 16>" ;;
+    *)    jc=$(rnd 6 9)
+          ipk="I1 = <b 0x0001><r 2><b 0x2112A442><r 12><r $(rnd 4 8)>
+I2 = <b 0x0101><r 2><b 0x2112A442><r 12><r $(rnd 12 24)>
+I3 = <b 0x0003><r 2><b 0x2112A442><r 12><r $(rnd 8 16)>" ;;
+  esac
   # H1-H4: случайные непересекающиеся диапазоны, по одному в каждой четверти uint31
   local q=536870910 h=() lo a b
   for i in 0 1 2 3; do lo=$(( 5 + i*q ))
@@ -246,7 +278,7 @@ PrivateKey = $(awg genkey)
 Address = $net.1/24
 ListenPort = $port
 MTU = 1280
-Jc = $(rnd 6 9)
+Jc = $jc
 Jmin = $jmin
 Jmax = 90
 S1 = $s1
@@ -257,9 +289,7 @@ H1 = ${h[0]}
 H2 = ${h[1]}
 H3 = ${h[2]}
 H4 = ${h[3]}
-I1 = <b 0x0001><r 2><b 0x2112A442><r 12><r $(rnd 4 8)>
-I2 = <b 0x0101><r 2><b 0x2112A442><r 12><r $(rnd 12 24)>
-I3 = <b 0x0003><r 2><b 0x2112A442><r 12><r $(rnd 8 16)>
+$ipk
 HeaderProtectionKey = $(awg genkey)
 ContentPaddingAddition = 50-200
 RekeyAfterTime = 120
@@ -294,6 +324,7 @@ renew31() {
 
 case "${1:-}" in
   diag) diag ;;
+  lab) lab "${2:-awg2}" "${3:-phone}" ;;
   peer-add) [[ -n ${2:-} ]] || exit 1; QUIET=1 add "$2" "${3:-client}" ;;
   peer-del) [[ -n ${2:-} && -n ${3:-} ]] || exit 1; peer_del "$2" "$3" ;;
   renew31) [[ -n ${2:-} ]] || { echo "usage: $0 renew31 <iface> [name]" >&2; exit 1; }; renew31 "$2" "${3:-phone}" ;;

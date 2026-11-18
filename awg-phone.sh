@@ -87,9 +87,12 @@ EOF
 
 # ---------- добавление клиента ----------
 add() {
-  local target=$1 name=${2:-phone}
+  local target=$1 name
+  name=$(printf '%s' "${2:-phone}" | tr -c 'A-Za-z0-9_.-' '_' | cut -c1-32)
   setctx "$target"
-  command -v qrencode >/dev/null || { echo "Нужен qrencode:  apt install -y qrencode" >&2; exit 1; }
+  [[ -n ${QUIET:-} ]] || command -v qrencode >/dev/null || { echo "Нужен qrencode:  apt install -y qrencode" >&2; exit 1; }
+  # блокировка: два одновременных вызова (бот) не получат один и тот же IP
+  exec 9>"${LOCK:-/run/awg-phone.lock}"; flock -w 20 9 || { echo "Не дождался блокировки" >&2; exit 1; }
 
   # конфиг сервера
   local conf=""
@@ -129,7 +132,7 @@ add() {
 
   # бэкап и применение — без перезапуска интерфейса
   local ts; ts=$(date +%Y%m%d-%H%M%S)
-  X cp -a "$conf" "$conf.bak-$ts"
+  if [[ -n ${QUIET:-} ]]; then X cp -a "$conf" "$conf.bak-last"; else X cp -a "$conf" "$conf.bak-$ts"; fi
   printf '%s\n' "$psk" | X sh -c "umask 077; cat > /tmp/.psk-$ts"
   X "$TOOL" set "$IF" peer "$cpub" preshared-key "/tmp/.psk-$ts" allowed-ips "$ip/32"
   X rm -f "/tmp/.psk-$ts"
@@ -138,6 +141,7 @@ add() {
 
   # клиентский конфиг: обфускация должна совпадать с сервером
   local out="${OUTDIR:-/root}/awg-$name-$ts.conf" k v
+  [[ -n ${QUIET:-} ]] && out=/dev/stdout && echo "#PUBKEY $cpub" && echo "#IP $ip"
   {
     echo "[Interface]"
     echo "PrivateKey = $cpriv"
@@ -155,6 +159,7 @@ add() {
     echo "AllowedIPs = 0.0.0.0/0, ::/0"
     echo "PersistentKeepalive = 25"
   } > "$out"
+  [[ -n ${QUIET:-} ]] && return 0
   chmod 600 "$out"
 
   hr "Готово: $name → $ip через ${CT:+docker:$CT:}$IF ($eip:$port)"
@@ -163,6 +168,22 @@ add() {
   echo; qrencode -t ansiutf8 < "$out"
   echo "Сканируйте в приложении AmneziaWG (или AmneziaVPN → «Добавить» → QR-код)."
   echo "Проверка после подключения:  $TOOL show $IF latest-handshakes | grep ${cpub:0:10}"
+}
+
+# ---------- удаление клиента (для бота) ----------
+peer_del() {
+  local ifn=$1 pk=$2 conf
+  [[ $pk =~ ^[A-Za-z0-9+/]{42,43}=$ ]] || { echo "Некорректный ключ" >&2; exit 1; }
+  setctx "$ifn"
+  conf=${CONF:-/etc/amnezia/amneziawg/$IF.conf}
+  exec 9>"${LOCK:-/run/awg-phone.lock}"; flock -w 20 9 || { echo "Не дождался блокировки" >&2; exit 1; }
+  grep -qF "$pk" "$conf" || { echo "NOT_FOUND"; exit 0; }
+  cp -a "$conf" "$conf.bak-last"
+  X "$TOOL" set "$IF" peer "$pk" remove
+  # конфиг: абзацы через пустую строку, выкидываем абзац с этим ключом
+  awk -v pk="$pk" 'BEGIN{RS="";ORS="\n\n"} index($0,pk)==0' "$conf.bak-last" > "$conf.tmp"
+  chmod 600 "$conf.tmp"; mv "$conf.tmp" "$conf"
+  echo "REMOVED"
 }
 
 # ---------- AWG 3.1 ----------
@@ -273,6 +294,8 @@ renew31() {
 
 case "${1:-}" in
   diag) diag ;;
+  peer-add) [[ -n ${2:-} ]] || exit 1; QUIET=1 add "$2" "${3:-client}" ;;
+  peer-del) [[ -n ${2:-} && -n ${3:-} ]] || exit 1; peer_del "$2" "$3" ;;
   renew31) [[ -n ${2:-} ]] || { echo "usage: $0 renew31 <iface> [name]" >&2; exit 1; }; renew31 "$2" "${3:-phone}" ;;
   check31) check31 ;;
   new31) [[ -n ${2:-} ]] || { echo "usage: $0 new31 <iface> [name]" >&2; exit 1; }; new31 "$2" "${3:-phone}" ;;

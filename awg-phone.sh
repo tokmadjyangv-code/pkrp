@@ -206,6 +206,54 @@ lab() {
   fi
 }
 
+# ---------- ретранслятор: пересылка UDP на удалённый сервер (без VPN и ключей) ----------
+relay() {
+  local tgt=$1 tport=$2 lport=${3:-$2}
+  [[ $tgt =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ && $tport =~ ^[0-9]+$ && $lport =~ ^[0-9]+$ ]] \
+    || { echo "usage: $0 relay <IP_сервера> <порт_сервера> [порт_здесь]" >&2; exit 1; }
+  local wan; wan=$(ip -4 route get 1.1.1.1 | awk '{for(i=1;i<NF;i++) if($i=="dev") print $(i+1)}')
+  local rules=/usr/local/sbin/awg-relay-rules
+  cat > "$rules" <<EOF
+#!/bin/sh
+# сгенерировано awg-phone relay: UDP :$lport -> $tgt:$tport
+sysctl -q -w net.ipv4.ip_forward=1
+add() { iptables -C "\$@" 2>/dev/null || iptables -I "\$@"; }
+add PREROUTING -t nat -i $wan -p udp --dport $lport -j DNAT --to-destination $tgt:$tport
+add POSTROUTING -t nat -o $wan -p udp -d $tgt --dport $tport -j MASQUERADE
+add FORWARD -p udp -d $tgt --dport $tport -j ACCEPT
+add FORWARD -p udp -s $tgt --sport $tport -j ACCEPT
+EOF
+  chmod 755 "$rules"
+  cat > /etc/systemd/system/awg-relay.service <<EOF
+[Unit]
+Description=UDP relay :$lport -> $tgt:$tport
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$rules
+[Install]
+WantedBy=multi-user.target
+EOF
+  echo 'net.ipv4.ip_forward=1' > /etc/sysctl.d/99-awg-relay.conf
+  systemctl daemon-reload; systemctl enable --now awg-relay.service
+  if command -v ufw >/dev/null && ufw status | grep -q 'Status: active'; then
+    ufw allow "$lport/udp" >/dev/null && echo "ufw: открыт $lport/udp"
+  fi
+  local me; me=$(ip -4 route get 1.1.1.1 | awk '{for(i=1;i<NF;i++) if($i=="src") print $(i+1)}')
+  hr "Ретранслятор готов: $me:$lport/udp -> $tgt:$tport"
+  echo "В профиле клиента: Endpoint = $me:$lport"
+  echo "Проверка счётчиков: bash $0 relay-check"
+}
+
+relay_check() {
+  set +e +o pipefail
+  echo "--- DNAT (пакеты от клиентов):"; iptables -t nat -L PREROUTING -v -n | grep -E 'DNAT' 
+  echo "--- FORWARD:"; iptables -L FORWARD -v -n | grep -E 'udp (dpt|spt)'
+  echo "--- активные потоки:"; (command -v conntrack >/dev/null && conntrack -L -p udp 2>/dev/null | head -5) || grep -c udp /proc/net/nf_conntrack 2>/dev/null
+}
+
 # ---------- AWG 3.1 ----------
 check31() {
   set +e +o pipefail
@@ -324,6 +372,8 @@ renew31() {
 
 case "${1:-}" in
   diag) diag ;;
+  relay) relay "${2:-}" "${3:-}" "${4:-}" ;;
+  relay-check) relay_check ;;
   lab) lab "${2:-awg2}" "${3:-phone}" ;;
   peer-add) [[ -n ${2:-} ]] || exit 1; QUIET=1 add "$2" "${3:-client}" ;;
   peer-del) [[ -n ${2:-} && -n ${3:-} ]] || exit 1; peer_del "$2" "$3" ;;

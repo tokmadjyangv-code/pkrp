@@ -144,7 +144,7 @@ add() {
     echo "Address = $ip/32"
     echo "DNS = ${DNS:-1.1.1.1, 1.0.0.1}"
     echo "MTU = ${MTU:-1280}"
-    for k in Jc Jmin Jmax S1 S2 S3 S4 H1 H2 H3 H4 I1 I2 I3 I4 I5 HeaderProtectionKey ContentPaddingAddition; do
+    for k in Jc Jmin Jmax S1 S2 S3 S4 H1 H2 H3 H4 I1 I2 I3 I4 I5 HeaderProtectionKey ContentPaddingAddition RekeyAfterTime RekeyTimeout RejectAfterTime KeepaliveTimeout MaxHandshakeAttempts; do
       v=$(getk "$k"); [[ -n $v ]] && echo "$k = $v"
     done
     echo
@@ -211,7 +211,12 @@ new31() {
   local s1 s2 s3 s4 jmin
   s1=$(rnd 15 150); s2=$(rnd 15 150); while (( s1 + 56 == s2 || s1 == s2 )); do s2=$(rnd 15 150); done
   s3=$(rnd 12 55); s4=$(rnd 12 27); (( s4 == 16 )) && s4=17
-  jmin=$(rnd 30 50)
+  jmin=30
+  # H1-H4: случайные непересекающиеся диапазоны, по одному в каждой четверти uint31
+  local q=536870910 h=() lo a b
+  for i in 0 1 2 3; do lo=$(( 5 + i*q ))
+    a=$(shuf -i "$lo-$(( lo + q/2 ))" -n1); b=$(shuf -i "$(( a + q/8 ))-$(( lo + q - 1 ))" -n1)
+    h+=("$a-$b"); done
 
   umask 077; mkdir -p "$dir"
   cat > "$conf" <<EOF
@@ -220,19 +225,27 @@ PrivateKey = $(awg genkey)
 Address = $net.1/24
 ListenPort = $port
 MTU = 1280
-Jc = 3
+Jc = $(rnd 6 9)
 Jmin = $jmin
-Jmax = $(( jmin + $(rnd 20 80) ))
+Jmax = 90
 S1 = $s1
 S2 = $s2
 S3 = $s3
 S4 = $s4
-H1 = 1
-H2 = 2
-H3 = 3
-H4 = 4
+H1 = ${h[0]}
+H2 = ${h[1]}
+H3 = ${h[2]}
+H4 = ${h[3]}
+I1 = <b 0x0001><r 2><b 0x2112A442><r 12><r $(rnd 4 8)>
+I2 = <b 0x0101><r 2><b 0x2112A442><r 12><r $(rnd 12 24)>
+I3 = <b 0x0003><r 2><b 0x2112A442><r 12><r $(rnd 8 16)>
 HeaderProtectionKey = $(awg genkey)
-ContentPaddingAddition = 32-128
+ContentPaddingAddition = 50-200
+RekeyAfterTime = 120
+RekeyTimeout = 5
+RejectAfterTime = 180
+KeepaliveTimeout = 25
+MaxHandshakeAttempts = 5
 PostUp = iptables -A FORWARD -i $ifn -j ACCEPT; iptables -A FORWARD -o $ifn -j ACCEPT; iptables -t nat -A POSTROUTING -s $net.0/24 -o $wan -j MASQUERADE
 PostDown = iptables -D FORWARD -i $ifn -j ACCEPT; iptables -D FORWARD -o $ifn -j ACCEPT; iptables -t nat -D POSTROUTING -s $net.0/24 -o $wan -j MASQUERADE
 EOF
@@ -245,8 +258,22 @@ EOF
   add "$ifn" "$name"
 }
 
+# пересоздать ТОЛЬКО наш интерфейс с новыми параметрами (старый конфиг сохраняется как .old-<дата>)
+renew31() {
+  local ifn=$1 name=${2:-phone} dir=${AWG_DIR:-/etc/amnezia/amneziawg} conf ts port
+  conf="$dir/$ifn.conf"; ts=$(date +%Y%m%d-%H%M%S)
+  [[ -f $conf ]] || { echo "Нет $conf" >&2; exit 1; }
+  case $ifn in awg0|awg1) echo "Отказ: $ifn не создавался этим скриптом" >&2; exit 1;; esac
+  port=$(awk -F' *= *' '$1=="ListenPort"{print $2}' "$conf")
+  systemctl stop "awg-quick@$ifn"
+  mv "$conf" "$conf.old-$ts"
+  echo "Остановлен $ifn, старый конфиг: $conf.old-$ts"
+  PORT=$port new31 "$ifn" "$name"
+}
+
 case "${1:-}" in
   diag) diag ;;
+  renew31) [[ -n ${2:-} ]] || { echo "usage: $0 renew31 <iface> [name]" >&2; exit 1; }; renew31 "$2" "${3:-phone}" ;;
   check31) check31 ;;
   new31) [[ -n ${2:-} ]] || { echo "usage: $0 new31 <iface> [name]" >&2; exit 1; }; new31 "$2" "${3:-phone}" ;;
   add)  [[ -n ${2:-} ]] || { echo "usage: $0 add <iface|docker:CT:iface> [name]" >&2; exit 1; }; add "$2" "${3:-phone}" ;;

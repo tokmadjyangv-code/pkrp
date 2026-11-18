@@ -4,6 +4,8 @@
 #   sudo bash awg-phone.sh diag                     # только чтение: какой интерфейс живой
 #   sudo bash awg-phone.sh add awg0 phone           # пир на хостовом интерфейсе awg0
 #   sudo bash awg-phone.sh add docker:amnezia-awg:wg0 phone   # пир внутри контейнера AmneziaVPN
+#   sudo bash awg-phone.sh check31                  # только чтение: готов ли сервер к AWG 3.1
+#   sudo bash awg-phone.sh new31 awg2 phone         # НОВЫЙ интерфейс AWG 3.1 рядом с остальными + клиент
 #
 # Что делает "add": генерирует ключи, делает бэкап конфига, ДОБАВЛЯЕТ пира в работающий
 # интерфейс через `awg set` (живое применение, туннель не перезапускается), дописывает [Peer]
@@ -109,7 +111,7 @@ add() {
   local base=${addr%.*} srvip=${addr%/*} used ip=""
   [[ ${addr#*/} == 24 ]] || echo "Внимание: маска /${addr#*/}, беру адреса из $base.0/24" >&2
   used=$( { X "$TOOL" show "$IF" allowed-ips | tr ' \t' '\n\n'; grep -i '^ *AllowedIPs' <<<"$SC" | tr ',=' '\n\n'; } \
-          | grep -oE '([0-9]+\.){3}[0-9]+' | sort -u)
+          | grep -oE '([0-9]+\.){3}[0-9]+' | sort -u || true)
   for n in $(seq 2 254); do
     [[ "$base.$n" == "$srvip" ]] && continue
     grep -qx "$base.$n" <<<"$used" || { ip="$base.$n"; break; }
@@ -142,7 +144,7 @@ add() {
     echo "Address = $ip/32"
     echo "DNS = ${DNS:-1.1.1.1, 1.0.0.1}"
     echo "MTU = ${MTU:-1280}"
-    for k in Jc Jmin Jmax S1 S2 S3 S4 H1 H2 H3 H4 I1 I2 I3 I4 I5; do
+    for k in Jc Jmin Jmax S1 S2 S3 S4 H1 H2 H3 H4 I1 I2 I3 I4 I5 HeaderProtectionKey ContentPaddingAddition; do
       v=$(getk "$k"); [[ -n $v ]] && echo "$k = $v"
     done
     echo
@@ -163,8 +165,90 @@ add() {
   echo "Проверка после подключения:  $TOOL show $IF latest-handshakes | grep ${cpub:0:10}"
 }
 
+# ---------- AWG 3.1 ----------
+check31() {
+  set +e +o pipefail
+  hr "Версии AmneziaWG"
+  echo "tools:  $(awg --version 2>&1)"
+  echo "module: $(cat /sys/module/amneziawg/version 2>/dev/null || echo 'не загружен')"
+  echo "kernel: $(uname -r)"
+  dpkg -l 2>/dev/null | awk '/amneziawg/{print "pkg:   ", $2, $3}'
+  hr "Занятые UDP-порты"
+  ss -ulpn | awk 'NR>1{print "  "$4}' | sort -u
+  hr "Подсети интерфейсов"
+  ip -4 -br addr | grep -v '^lo'
+}
+
+rnd() { echo $(( $1 + RANDOM % ($2 - $1 + 1) )); }
+
+new31() {
+  local ifn=$1 name=${2:-phone}
+  local dir=${AWG_DIR:-/etc/amnezia/amneziawg} conf
+  conf="$dir/$ifn.conf"
+  [[ -e $conf ]] && { echo "$conf уже существует — ничего не трогаю" >&2; exit 1; }
+  ip link show "$ifn" >/dev/null 2>&1 && { echo "Интерфейс $ifn уже есть" >&2; exit 1; }
+
+  local tv; tv=$(awg --version 2>&1 || true)
+  [[ $tv =~ v3\.([1-9]|[0-9]{2}) || -n ${FORCE31:-} ]] || {
+    echo "Инструменты: '$tv' — нужен amneziawg-tools v3.1+. Обновите: apt update && apt install --only-upgrade amneziawg-tools amneziawg-dkms" >&2; exit 1; }
+
+  # порт: свободный случайный (или PORT=...)
+  local port=${PORT:-}
+  if [[ -z $port ]]; then
+    for _ in $(seq 50); do p=$(rnd 20000 60000)
+      ss -Huln | awk '{print $4}' | grep -qE ":$p\$" || { port=$p; break; }; done
+  fi
+  [[ -n $port ]] || { echo "Не нашёл свободный порт" >&2; exit 1; }
+  ss -Huln | awk '{print $4}' | grep -qE ":$port\$" && { echo "Порт $port занят" >&2; exit 1; }
+
+  # подсеть: первая свободная из 10.9.N.0/24
+  local net=""
+  for n in $(seq 9 250); do ip -4 addr | grep -q " 10\.9\.$n\." || { net="10.9.$n"; break; }; done
+  local wan; wan=$(ip -4 route get 1.1.1.1 | awk '{for(i=1;i<NF;i++) if($i=="dev") print $(i+1)}')
+  [[ -n $wan ]] || { echo "Не определён внешний интерфейс" >&2; exit 1; }
+
+  # параметры маскировки (профиль 3.1: H1-H4 = 1-4, защита заголовков, паддинг)
+  local s1 s2 s3 s4 jmin
+  s1=$(rnd 15 150); s2=$(rnd 15 150); while (( s1 + 56 == s2 || s1 == s2 )); do s2=$(rnd 15 150); done
+  s3=$(rnd 12 55); s4=$(rnd 12 27); (( s4 == 16 )) && s4=17
+  jmin=$(rnd 30 50)
+
+  umask 077; mkdir -p "$dir"
+  cat > "$conf" <<EOF
+[Interface]
+PrivateKey = $(awg genkey)
+Address = $net.1/24
+ListenPort = $port
+MTU = 1280
+Jc = 3
+Jmin = $jmin
+Jmax = $(( jmin + $(rnd 20 80) ))
+S1 = $s1
+S2 = $s2
+S3 = $s3
+S4 = $s4
+H1 = 1
+H2 = 2
+H3 = 3
+H4 = 4
+HeaderProtectionKey = $(awg genkey)
+ContentPaddingAddition = 32-128
+PostUp = iptables -A FORWARD -i $ifn -j ACCEPT; iptables -A FORWARD -o $ifn -j ACCEPT; iptables -t nat -A POSTROUTING -s $net.0/24 -o $wan -j MASQUERADE
+PostDown = iptables -D FORWARD -i $ifn -j ACCEPT; iptables -D FORWARD -o $ifn -j ACCEPT; iptables -t nat -D POSTROUTING -s $net.0/24 -o $wan -j MASQUERADE
+EOF
+  hr "Создан $conf (порт $port, подсеть $net.0/24, выход через $wan)"
+  grep -vE 'PrivateKey|HeaderProtectionKey' "$conf"
+
+  systemctl enable --now "awg-quick@$ifn" || {
+    echo "Не поднялся. Лог: journalctl -u awg-quick@$ifn -n 30. Конфиг оставлен: $conf" >&2; exit 1; }
+  awg show "$ifn" | head -5
+  add "$ifn" "$name"
+}
+
 case "${1:-}" in
   diag) diag ;;
+  check31) check31 ;;
+  new31) [[ -n ${2:-} ]] || { echo "usage: $0 new31 <iface> [name]" >&2; exit 1; }; new31 "$2" "${3:-phone}" ;;
   add)  [[ -n ${2:-} ]] || { echo "usage: $0 add <iface|docker:CT:iface> [name]" >&2; exit 1; }; add "$2" "${3:-phone}" ;;
   *)    sed -n '2,12p' "$0" ;;
 esac
